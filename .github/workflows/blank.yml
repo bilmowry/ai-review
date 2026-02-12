@@ -1,0 +1,21 @@
+name: Manual Q Review with Summary
+
+on:
+  workflow_dispatch:
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      
+      - name: Generate review summary
+        run: |
+          echo "# 📊 Amazon Q Review Report" >> $GITHUB_STEP_SUMMARY
+          echo "**Generated:** $(date)" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## Recent Commits" >> $GITHUB_STEP_SUMMARY
+          
+          git log --since="1 day ago" --pretty=format:"- **%h** by %an: %s" >> $GITHUB_STEP_SUMMARY
