@@ -1,0 +1,176 @@
+name: CodeQL Manual Scan
+
+on:
+  workflow_dispatch:
+    inputs:
+      scan_scope:
+        description: 'Scan scope'
+        required: true
+        type: choice
+        options:
+          - 'Full repository'
+          - 'Last 24 hours'
+          - 'Last 7 days'
+          - 'Last 30 days'
+        default: 'Full repository'
+      
+      enable_push_trigger:
+        description: 'Enable automatic scan on push to main?'
+        required: false
+        type: boolean
+        default: false
+  
+  push:
+    branches: [ main, develop ]
+    # This will only trigger if you manually enable it via workflow_dispatch
+    # GitHub doesn't support dynamic on: triggers, so this is always present
+    # but you can disable the job execution with a condition
+
+jobs:
+  check-trigger:
+    name: Check if scan should run
+    runs-on: ubuntu-latest
+    outputs:
+      should_run: ${{ steps.check.outputs.should_run }}
+      scan_scope: ${{ steps.check.outputs.scan_scope }}
+    steps:
+      - name: Determine if scan should run
+        id: check
+        run: |
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            echo "should_run=true" >> $GITHUB_OUTPUT
+            echo "scan_scope=${{ inputs.scan_scope }}" >> $GITHUB_OUTPUT
+          elif [ "${{ github.event_name }}" == "push" ]; then
+            # For push events, only run if you want auto-trigger
+            # You'll need to manually set this repository variable
+            echo "should_run=false" >> $GITHUB_OUTPUT
+            echo "scan_scope=Full repository" >> $GITHUB_OUTPUT
+            echo "⚠️ Auto-trigger on push is disabled. Use workflow_dispatch to run manually." >> $GITHUB_STEP_SUMMARY
+          fi
+
+  analyze:
+    name: CodeQL Analysis
+    needs: check-trigger
+    if: needs.check-trigger.outputs.should_run == 'true'
+    runs-on: ubuntu-latest
+    
+    permissions:
+      security-events: write
+      contents: read
+      actions: read
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Full history for time-based filtering
+      
+      - name: Determine scan parameters
+        id: params
+        run: |
+          SCOPE="${{ needs.check-trigger.outputs.scan_scope }}"
+          echo "Scan scope: $SCOPE"
+          
+          case "$SCOPE" in
+            "Last 24 hours")
+              SINCE="1 day ago"
+              DISPLAY="Last 24 hours"
+              ;;
+            "Last 7 days")
+              SINCE="7 days ago"
+              DISPLAY="Last 7 days"
+              ;;
+            "Last 30 days")
+              SINCE="30 days ago"
+              DISPLAY="Last 30 days"
+              ;;
+            *)
+              SINCE=""
+              DISPLAY="Full repository"
+              ;;
+          esac
+          
+          echo "since=$SINCE" >> $GITHUB_OUTPUT
+          echo "display=$DISPLAY" >> $GITHUB_OUTPUT
+          
+          # Get list of changed files if time-limited
+          if [ -n "$SINCE" ]; then
+            CHANGED_FILES=$(git log --since="$SINCE" --name-only --pretty=format: | sort -u | grep -E '\.(java|groovy|py|js|ts|cpp|c|h|cs|go|rb)$' || true)
+            FILE_COUNT=$(echo "$CHANGED_FILES" | grep -v '^$' | wc -l)
+            
+            echo "Changed files in scope: $FILE_COUNT"
+            echo "$CHANGED_FILES" > changed_files.txt
+            
+            if [ $FILE_COUNT -eq 0 ]; then
+              echo "No code files changed in this period"
+              echo "has_changes=false" >> $GITHUB_OUTPUT
+            else
+              echo "has_changes=true" >> $GITHUB_OUTPUT
+              echo "Files to analyze:"
+              cat changed_files.txt
+            fi
+          else
+            echo "has_changes=true" >> $GITHUB_OUTPUT
+          fi
+      
+      - name: Display scan scope
+        run: |
+          echo "# 🔍 CodeQL Security Analysis" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Scan Scope:** ${{ steps.params.outputs.display }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Triggered by:** ${{ github.actor }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Date:** $(date)" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          if [ "${{ steps.params.outputs.has_changes }}" == "false" ]; then
+            echo "⚠️ **No code files changed in this period**" >> $GITHUB_STEP_SUMMARY
+          fi
+      
+      - name: Initialize CodeQL
+        if: steps.params.outputs.has_changes == 'true'
+        uses: github/codeql-action/init@v3
+        with:
+          languages: java, python, javascript  # Adjust to your languages
+          # Use java for Groovy code
+      
+      - name: Autobuild
+        if: steps.params.outputs.has_changes == 'true'
+        uses: github/codeql-action/autobuild@v3
+      
+      - name: Perform CodeQL Analysis
+        if: steps.params.outputs.has_changes == 'true'
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: "/codeql/${{ steps.params.outputs.display }}"
+      
+      - name: Generate results summary
+        if: always()
+        run: |
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "---" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          if [ "${{ steps.params.outputs.has_changes }}" == "true" ]; then
+            echo "## ✅ Analysis Complete" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "### View Results" >> $GITHUB_STEP_SUMMARY
+            echo "1. Go to the [Security tab](https://github.com/${{ github.repository }}/security)" >> $GITHUB_STEP_SUMMARY
+            echo "2. Click **Code scanning** in the left sidebar" >> $GITHUB_STEP_SUMMARY
+            echo "3. Filter by tool: **CodeQL**" >> $GITHUB_STEP_SUMMARY
+            echo "4. Review any alerts found" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "[🔗 Direct link to Code Scanning](https://github.com/${{ github.repository }}/security/code-scanning)" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "## ℹ️ No Scan Performed" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "No code files were changed in the selected time period." >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "---" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Scan Configuration" >> $GITHUB_STEP_SUMMARY
+          echo "- **Scope:** ${{ steps.params.outputs.display }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Languages:** Java (Groovy), Python, JavaScript" >> $GITHUB_STEP_SUMMARY
+          echo "- **Branch:** ${{ github.ref_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Commit:** ${{ github.sha }}" >> $GITHUB_STEP_SUMMARY
