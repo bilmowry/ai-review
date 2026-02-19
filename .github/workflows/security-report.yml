@@ -1,0 +1,172 @@
+name: Security Report
+
+on:
+  push:
+    branches: [ main, develop ]
+  schedule:
+    - cron: '0 6 * * 1'  # Weekly full scan Monday 6am
+  workflow_dispatch:
+    inputs:
+      scan_scope:
+        description: 'Scan scope'
+        required: true
+        default: 'full'
+        type: choice
+        options:
+          - full
+          - recent_7_days
+          - recent_30_days
+      branch:
+        description: 'Branch to scan (leave blank for current default branch)'
+        required: false
+        default: ''
+
+jobs:
+
+  # ── Job 1: Secret Detection ─────────────────────────────────────────────────
+  gitleaks:
+    name: Gitleaks Secret Scan
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Full history so Gitleaks can scan all commits
+
+      - name: Set Gitleaks date filter
+        id: date_filter
+        run: |
+          SCOPE="${{ github.event.inputs.scan_scope || 'full' }}"
+          if [ "$SCOPE" = "recent_7_days" ]; then
+            echo "since=--log-opts=--since=7.days.ago" >> $GITHUB_OUTPUT
+          elif [ "$SCOPE" = "recent_30_days" ]; then
+            echo "since=--log-opts=--since=30.days.ago" >> $GITHUB_OUTPUT
+          else
+            echo "since=" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Run Gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          args: ${{ steps.date_filter.outputs.since }}
+        continue-on-error: true  # Don't block push; report findings instead
+
+      - name: Convert Gitleaks report to SARIF
+        if: always()
+        run: |
+          if [ -f gitleaks-report.json ]; then
+            # Convert JSON findings to SARIF format for GitHub Security tab
+            python3 << 'EOF'
+          import json, sys
+
+          try:
+              with open('gitleaks-report.json') as f:
+                  findings = json.load(f)
+          except:
+              findings = []
+
+          sarif = {
+              "version": "2.1.0",
+              "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
+              "runs": [{
+                  "tool": {
+                      "driver": {
+                          "name": "Gitleaks",
+                          "version": "8.x",
+                          "rules": [{"id": "gitleaks", "name": "SecretDetected",
+                                     "shortDescription": {"text": "Potential secret detected"}}]
+                      }
+                  },
+                  "results": [
+                      {
+                          "ruleId": "gitleaks",
+                          "message": {"text": f"Potential secret: {f.get('Description', 'Unknown')} (rule: {f.get('RuleID', 'unknown')})"},
+                          "locations": [{
+                              "physicalLocation": {
+                                  "artifactLocation": {"uri": f.get('File', 'unknown')},
+                                  "region": {"startLine": f.get('StartLine', 1)}
+                              }
+                          }],
+                          "level": "error"
+                      }
+                      for f in (findings if isinstance(findings, list) else [])
+                  ]
+              }]
+          }
+
+          with open('gitleaks.sarif', 'w') as f:
+              json.dump(sarif, f)
+          print(f"Converted {len(sarif['runs'][0]['results'])} findings to SARIF")
+          EOF
+          else
+            echo '{"version":"2.1.0","runs":[{"tool":{"driver":{"name":"Gitleaks"}},"results":[]}]}' > gitleaks.sarif
+          fi
+
+      - name: Upload Gitleaks SARIF to GitHub Security Tab
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: gitleaks.sarif
+          category: gitleaks
+
+  # ── Job 2: SAST ─────────────────────────────────────────────────────────────
+  semgrep:
+    name: Semgrep SAST
+    runs-on: ubuntu-latest
+    permissions:
+      security-events: write
+      contents: read
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Run Semgrep
+        uses: semgrep/semgrep-action@v1
+        with:
+          config: >-
+            p/default
+            p/secrets
+            p/owasp-top-ten
+            p/java
+          generateSarif: "1"
+        env:
+          # SEMGREP_APP_TOKEN: ${{ secrets.SEMGREP_APP_TOKEN }}
+          SEMGREP_TIMEOUT: "300"
+
+      - name: Upload Semgrep SARIF to GitHub Security Tab
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: semgrep.sarif
+          category: semgrep
+
+  # ── Job 3: Summary ──────────────────────────────────────────────────────────
+  summary:
+    name: Scan Summary
+    runs-on: ubuntu-latest
+    needs: [ gitleaks, semgrep ]
+    if: always()
+
+    steps:
+      - name: Write summary
+        run: |
+          echo "# 🔐 Security Scan Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Scanner | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|---------|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Gitleaks (secrets) | ${{ needs.gitleaks.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Semgrep (SAST) | ${{ needs.semgrep.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Triggered by:** \`${{ github.actor }}\` on \`${{ github.ref_name }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "**Scan scope:** \`${{ github.event.inputs.scan_scope || 'full (auto-triggered)' }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "📋 [View all alerts](https://github.com/${{ github.repository }}/security/code-scanning)" >> $GITHUB_STEP_SUMMARY
