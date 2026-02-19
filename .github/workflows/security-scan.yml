@@ -1,0 +1,230 @@
+name: Security Scan (Semgrep + Gitleaks)
+
+on:
+  workflow_dispatch:
+    inputs:
+      scan_scope:
+        description: 'Scan scope'
+        required: true
+        type: choice
+        options:
+          - 'Full repository'
+          - 'Last 24 hours'
+          - 'Last 7 days'
+          - 'Last 30 days'
+        default: 'Full repository'
+
+jobs:
+  security-scan:
+    name: Code Security & Secrets Detection
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Full history for Gitleaks and time-based filtering
+      
+      - name: Determine scan parameters
+        id: params
+        run: |
+          SCOPE="${{ inputs.scan_scope }}"
+          echo "Scan scope: $SCOPE"
+          
+          case "$SCOPE" in
+            "Last 24 hours")
+              SINCE="1 day ago"
+              DISPLAY="Last 24 hours"
+              ;;
+            "Last 7 days")
+              SINCE="7 days ago"
+              DISPLAY="Last 7 days"
+              ;;
+            "Last 30 days")
+              SINCE="30 days ago"
+              DISPLAY="Last 30 days"
+              ;;
+            *)
+              SINCE=""
+              DISPLAY="Full repository"
+              ;;
+          esac
+          
+          echo "display=$DISPLAY" >> $GITHUB_OUTPUT
+          echo "since=$SINCE" >> $GITHUB_OUTPUT
+          
+          # Get changed files if time-limited
+          if [ -n "$SINCE" ]; then
+            git log --since="$SINCE" --name-only --pretty=format: | sort -u > all_changed.txt
+            grep -E '\.(java|groovy|py|js|ts|rb|go|php|sql|sh)$' all_changed.txt > changed_files.txt || true
+            
+            FILE_COUNT=$(cat changed_files.txt | grep -v '^$' | wc -l)
+            
+            if [ $FILE_COUNT -eq 0 ]; then
+              echo "has_changes=false" >> $GITHUB_OUTPUT
+            else
+              echo "has_changes=true" >> $GITHUB_OUTPUT
+              echo "Found $FILE_COUNT changed code files"
+            fi
+          else
+            echo "has_changes=true" >> $GITHUB_OUTPUT
+          fi
+      
+      # ==================== SEMGREP SCAN ====================
+      
+      - name: Install Semgrep
+        if: steps.params.outputs.has_changes == 'true'
+        run: pip install semgrep
+      
+      - name: Run Semgrep scan
+        if: steps.params.outputs.has_changes == 'true'
+        run: |
+          echo "Running Semgrep code security scan..."
+          
+          if [ "${{ steps.params.outputs.display }}" == "Full repository" ]; then
+            semgrep --config=auto --text --verbose . > semgrep_output.txt 2>&1 || true
+            semgrep --config=auto --sarif -o semgrep.sarif . || true
+          else
+            if [ -f changed_files.txt ] && [ -s changed_files.txt ]; then
+              cat changed_files.txt | xargs semgrep --config=auto --text --verbose > semgrep_output.txt 2>&1 || true
+              cat changed_files.txt | xargs semgrep --config=auto --sarif -o semgrep.sarif || true
+            fi
+          fi
+      
+      - name: Upload Semgrep results to Security tab
+        if: steps.params.outputs.has_changes == 'true'
+        uses: github/codeql-action/upload-sarif@v3
+        continue-on-error: true
+        with:
+          sarif_file: semgrep.sarif
+          category: semgrep-security
+      
+      # ==================== GITLEAKS SCAN ====================
+      
+      - name: Run Gitleaks secrets scan
+        if: steps.params.outputs.has_changes == 'true'
+        run: |
+          echo "Running Gitleaks secrets detection..."
+          
+          # Install Gitleaks
+          wget https://github.com/gitleaks/gitleaks/releases/download/v8.18.2/gitleaks_8.18.2_linux_x64.tar.gz
+          tar -xzf gitleaks_8.18.2_linux_x64.tar.gz
+          chmod +x gitleaks
+          
+          if [ "${{ steps.params.outputs.display }}" == "Full repository" ]; then
+            ./gitleaks detect --source . --report-path gitleaks_report.json --report-format json --verbose > gitleaks_output.txt 2>&1 || true
+          else
+            # For time-based scans, check commits in that period
+            if [ -n "${{ steps.params.outputs.since }}" ]; then
+              SINCE_DATE=$(date -d "${{ steps.params.outputs.since }}" +%Y-%m-%d)
+              ./gitleaks detect --source . --log-opts="--since=$SINCE_DATE" --report-path gitleaks_report.json --report-format json --verbose > gitleaks_output.txt 2>&1 || true
+            fi
+          fi
+      
+      # ==================== GENERATE SUMMARY ====================
+      
+      - name: Generate comprehensive summary
+        if: always()
+        run: |
+          echo "# 🔒 Security Scan Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Scan Scope:** ${{ steps.params.outputs.display }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Triggered by:** @${{ github.actor }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Date:** $(date)" >> $GITHUB_STEP_SUMMARY
+          echo "**Branch:** ${{ github.ref_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          if [ "${{ steps.params.outputs.has_changes }}" == "false" ]; then
+            echo "⚠️ **No code files changed in this period**" >> $GITHUB_STEP_SUMMARY
+            exit 0
+          fi
+          
+          echo "---" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          # ========== SEMGREP RESULTS ==========
+          echo "## 🔍 Semgrep Code Security Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          if [ -f semgrep_output.txt ]; then
+            # Count findings
+            SEMGREP_FINDINGS=$(grep -c "severity" semgrep_output.txt 2>/dev/null || echo "0")
+            
+            if [ "$SEMGREP_FINDINGS" -gt 0 ]; then
+              echo "**Status:** ⚠️ Issues found" >> $GITHUB_STEP_SUMMARY
+              echo "" >> $GITHUB_STEP_SUMMARY
+              echo "<details>" >> $GITHUB_STEP_SUMMARY
+              echo "<summary>View Semgrep findings (click to expand)</summary>" >> $GITHUB_STEP_SUMMARY
+              echo "" >> $GITHUB_STEP_SUMMARY
+              echo '```' >> $GITHUB_STEP_SUMMARY
+              head -200 semgrep_output.txt >> $GITHUB_STEP_SUMMARY
+              echo '```' >> $GITHUB_STEP_SUMMARY
+              echo "</details>" >> $GITHUB_STEP_SUMMARY
+            else
+              echo "**Status:** ✅ No issues found" >> $GITHUB_STEP_SUMMARY
+            fi
+          else
+            echo "**Status:** ℹ️ Scan did not run or no output generated" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "---" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          # ========== GITLEAKS RESULTS ==========
+          echo "## 🔐 Gitleaks Secrets Detection Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          if [ -f gitleaks_report.json ]; then
+            # Count secrets found
+            SECRETS_COUNT=$(jq '. | length' gitleaks_report.json 2>/dev/null || echo "0")
+            
+            if [ "$SECRETS_COUNT" -gt 0 ]; then
+              echo "**Status:** 🚨 **$SECRETS_COUNT secret(s) detected!**" >> $GITHUB_STEP_SUMMARY
+              echo "" >> $GITHUB_STEP_SUMMARY
+              echo "<details>" >> $GITHUB_STEP_SUMMARY
+              echo "<summary>View detected secrets (click to expand)</summary>" >> $GITHUB_STEP_SUMMARY
+              echo "" >> $GITHUB_STEP_SUMMARY
+              echo '```json' >> $GITHUB_STEP_SUMMARY
+              jq '.' gitleaks_report.json >> $GITHUB_STEP_SUMMARY
+              echo '```' >> $GITHUB_STEP_SUMMARY
+              echo "</details>" >> $GITHUB_STEP_SUMMARY
+            else
+              echo "**Status:** ✅ No secrets detected" >> $GITHUB_STEP_SUMMARY
+            fi
+          else
+            echo "**Status:** ℹ️ Scan completed, no secrets file generated (likely no secrets found)" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "---" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          # ========== LINKS ==========
+          echo "## 📊 Additional Resources" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- [View in Security Tab](https://github.com/${{ github.repository }}/security/code-scanning)" >> $GITHUB_STEP_SUMMARY
+          echo "- [Download detailed artifacts below](#artifacts)" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          # ========== CONFIGURATION ==========
+          echo "---" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Scan Configuration" >> $GITHUB_STEP_SUMMARY
+          echo "- **Semgrep rules:** Auto (security + best practices)" >> $GITHUB_STEP_SUMMARY
+          echo "- **Gitleaks:** Full secret detection" >> $GITHUB_STEP_SUMMARY
+          echo "- **Languages:** Java, Groovy, Python, JavaScript, TypeScript, Ruby, Go, PHP, SQL" >> $GITHUB_STEP_SUMMARY
+      
+      # ==================== UPLOAD ARTIFACTS ====================
+      
+      - name: Upload all scan results as artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-scan-results
+          path: |
+            semgrep_output.txt
+            semgrep.sarif
+            gitleaks_output.txt
+            gitleaks_report.json
+            changed_files.txt
