@@ -1,4 +1,4 @@
-name: Security Scan
+name: Security Report
 
 on:
   push:
@@ -14,6 +14,7 @@ on:
         type: choice
         options:
           - full
+          - recent_1_days
           - recent_7_days
           - recent_30_days
       branch:
@@ -41,7 +42,9 @@ jobs:
         id: date_filter
         run: |
           SCOPE="${{ github.event.inputs.scan_scope || 'full' }}"
-          if [ "$SCOPE" = "recent_7_days" ]; then
+          if [ "$SCOPE" = "recent_1_days" ]; then
+            echo "since=--log-opts=--since=1.days.ago" >> $GITHUB_OUTPUT
+          elif [ "$SCOPE" = "recent_7_days" ]; then
             echo "since=--log-opts=--since=7.days.ago" >> $GITHUB_OUTPUT
           elif [ "$SCOPE" = "recent_30_days" ]; then
             echo "since=--log-opts=--since=30.days.ago" >> $GITHUB_OUTPUT
