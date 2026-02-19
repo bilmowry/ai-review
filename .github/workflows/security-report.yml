@@ -149,6 +149,69 @@ jobs:
           sarif_file: semgrep.sarif
           category: semgrep
 
+      - name: Write Semgrep results to Job Summary
+        if: always()
+        run: |
+          python3 << 'EOF'
+          import json, os
+
+          try:
+              with open('semgrep.sarif') as f:
+                  sarif = json.load(f)
+          except:
+              sarif = {"runs": []}
+
+          results = []
+          for run in sarif.get("runs", []):
+              rules = {r["id"]: r for r in run.get("tool", {}).get("driver", {}).get("rules", [])}
+              for result in run.get("results", []):
+                  rule_id = result.get("ruleId", "unknown")
+                  rule    = rules.get(rule_id, {})
+                  tags    = rule.get("properties", {}).get("tags", [])
+                  level   = result.get("level", "warning")
+                  msg     = result.get("message", {}).get("text", "")[:120]
+                  locs    = result.get("locations", [])
+                  uri     = locs[0]["physicalLocation"]["artifactLocation"]["uri"] if locs else "unknown"
+                  line    = locs[0]["physicalLocation"].get("region", {}).get("startLine", "?") if locs else "?"
+
+                  category = "🔒 Security" if any(t in ["security", "correctness"] for t in [t.lower() for t in tags]) else "🔧 Code Quality"
+                  icon     = "🔴" if level == "error" else "🟡" if level == "warning" else "🔵"
+
+                  results.append({
+                      "category": category,
+                      "icon": icon,
+                      "level": level,
+                      "rule": rule_id,
+                      "file": uri,
+                      "line": line,
+                      "msg": msg
+                  })
+
+          summary = os.environ["GITHUB_STEP_SUMMARY"]
+          with open(summary, "a") as f:
+              f.write("# 🔍 Semgrep Scan Results\n\n")
+
+              if not results:
+                  f.write("✅ No issues found.\n\n")
+              else:
+                  # Group by category
+                  for cat in ["🔒 Security", "🔧 Code Quality"]:
+                      group = [r for r in results if r["category"] == cat]
+                      if not group:
+                          continue
+                      f.write(f"## {cat} — {len(group)} finding(s)\n\n")
+                      f.write("| | Rule | File | Line | Message |\n")
+                      f.write("|---|---|---|---|---|\n")
+                      for r in group:
+                          f.write(f"| {r['icon']} | `{r['rule']}` | `{r['file']}` | {r['line']} | {r['msg']} |\n")
+                      f.write("\n")
+
+              total_sec = len([r for r in results if r["category"] == "🔒 Security"])
+              total_qa  = len([r for r in results if r["category"] == "🔧 Code Quality"])
+              f.write(f"> **{total_sec}** security finding(s) &nbsp;|&nbsp; **{total_qa}** code quality finding(s)\n\n")
+              f.write(f"📋 [View full alerts in Security tab](https://github.com/{os.environ.get('GITHUB_REPOSITORY','')}/security/code-scanning)\n")
+          EOF
+
   # ── Job 3: Summary ──────────────────────────────────────────────────────────
   summary:
     name: Scan Summary
